@@ -1,0 +1,131 @@
+name: Release
+
+# Tags are created locally with `just tag`, which uses `tapit nextgitrelease`.
+# Pushing the tag builds the binaries and publishes the GitHub release.
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Test
+        run: go test ./...
+
+  build:
+    needs: test
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        goos: [linux]
+        goarch: [amd64, arm64]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Build
+        env:
+          CGO_ENABLED: '0'
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          VERSION: ${{ github.ref_name }}
+        run: |
+          mkdir -p dist
+          NAME="prefix_updater_${VERSION}_${GOOS}_${GOARCH}"
+          go build -trimpath \
+            -ldflags "-s -w -X main.version=${VERSION} -X main.commit=${GITHUB_SHA} -X main.date=$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            -o "dist/${NAME}" .
+          ( cd dist && sha256sum "${NAME}" > "${NAME}.sha256" )
+
+      - name: Verify the binary is statically linked
+        if: matrix.goarch == 'amd64'
+        run: |
+          file dist/* | tee /dev/stderr | grep -q "statically linked"
+          ./dist/prefix_updater_${{ github.ref_name }}_linux_amd64 --version
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: prefix_updater_${{ matrix.goos }}_${{ matrix.goarch }}
+          path: dist/*
+          if-no-files-found: error
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Download binaries
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Build release notes
+        id: notes
+        run: |
+          PREV_TAG=$(git describe --tags --abbrev=0 "${GITHUB_REF_NAME}^" 2>/dev/null || echo "")
+          if [ -z "$PREV_TAG" ]; then
+            RANGE="$GITHUB_REF_NAME"
+          else
+            RANGE="$PREV_TAG..$GITHUB_REF_NAME"
+          fi
+          NOTES=$(git log $RANGE --pretty=tformat:'- %s [%an]')
+          if [ -z "$NOTES" ]; then
+            NOTES="- No changes recorded."
+          fi
+          {
+            echo "notes<<EOF"
+            echo "$NOTES"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: ${{ github.ref_name }}
+          body: ${{ steps.notes.outputs.notes }}
+          files: dist/*
+          fail_on_unmatched_files: true
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+
+      - name: Summary
+        run: |
+          echo "## Release ${GITHUB_REF_NAME} :rocket:" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "**Commit:** \`${GITHUB_SHA}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "### Assets" >> "$GITHUB_STEP_SUMMARY"
+          for f in dist/*; do
+            echo "- \`$(basename "$f")\`" >> "$GITHUB_STEP_SUMMARY"
+          done
